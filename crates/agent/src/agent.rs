@@ -1697,17 +1697,20 @@ impl NativeAgent {
                             this.register_session(thread.clone(), project_id, ref_count, cx)
                         })
                         .map_err(Arc::new)?;
+                    acp_thread.update(cx, |thread, _cx| thread.begin_history_replay());
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
-                    cx.update(|cx| {
-                        NativeAgentConnection::handle_thread_events(
-                            events,
-                            acp_thread.downgrade(),
-                            None,
-                            cx,
-                        )
-                    })
-                    .await
-                    .map_err(Arc::new)?;
+                    let replay_result = cx
+                        .update(|cx| {
+                            NativeAgentConnection::handle_thread_events(
+                                events,
+                                acp_thread.downgrade(),
+                                None,
+                                cx,
+                            )
+                        })
+                        .await;
+                    acp_thread.update(cx, |thread, _cx| thread.finish_history_replay());
+                    replay_result.map_err(Arc::new)?;
                     acp_thread.update(cx, |thread, cx| {
                         thread.snapshot_completed_plan(cx);
                     });

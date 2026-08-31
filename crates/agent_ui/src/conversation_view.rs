@@ -1355,36 +1355,6 @@ impl ConversationView {
             cx.observe(&action_log, |_, _, cx| cx.notify()),
         ];
 
-        let subagent_sessions = thread
-            .read(cx)
-            .entries()
-            .iter()
-            .filter_map(|entry| match entry {
-                AgentThreadEntry::ToolCall(call) => call
-                    .subagent_session_info
-                    .as_ref()
-                    .map(|i| i.session_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        if !subagent_sessions.is_empty() {
-            let parent_session_id = thread.read(cx).session_id().clone();
-            cx.spawn_in(window, async move |this, cx| {
-                this.update_in(cx, |this, window, cx| {
-                    for subagent_id in subagent_sessions {
-                        this.load_subagent_session(
-                            subagent_id,
-                            parent_session_id.clone(),
-                            window,
-                            cx,
-                        );
-                    }
-                })
-            })
-            .detach();
-        }
-
         let profile_selector: Option<Rc<agent::NativeAgentConnection>> =
             connection.clone().downcast();
         let profile_selector = profile_selector
@@ -2107,6 +2077,11 @@ impl ConversationView {
                     return;
                 };
                 connected.threads.insert(subagent_session_id, view);
+                let parent_view = connected.threads.get(&parent_session_id).cloned();
+                if let Some(parent_view) = parent_view {
+                    parent_view.update(cx, |_parent_view, cx| cx.notify());
+                }
+                cx.notify();
             })
         })
         .detach();
@@ -4396,6 +4371,213 @@ pub(crate) mod tests {
             let state = view.active_thread().unwrap();
             assert!(state.read(cx).resumed_without_history);
             assert_eq!(state.read(cx).list_state.item_count(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_existing_session_history_loads_lazily_integration(cx: &mut TestAppContext) {
+        const HISTORICAL_DIFF_COUNT: usize = 128;
+
+        init_test(cx);
+
+        let root_session_id = acp::SessionId::new("large-history");
+        let subagent_session_id = acp::SessionId::new("historical-subagent");
+        let server = FakeAcpAgentServer::new();
+        let load_session_count = server.load_session_count();
+
+        let fs = FakeFs::new(cx.executor());
+        let mut history = Vec::with_capacity(HISTORICAL_DIFF_COUNT + 1);
+        for index in 0..HISTORICAL_DIFF_COUNT {
+            let path = format!("/outside-{index}/history.rs");
+            fs.insert_tree(
+                format!("/outside-{index}"),
+                json!({ "history.rs": "fn before() {}\n" }),
+            )
+            .await;
+            history.push(acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(format!("historical-edit-{index}"), format!("Edit {path}"))
+                    .kind(acp::ToolKind::Edit)
+                    .status(acp::ToolCallStatus::Completed)
+                    .content(vec![acp::ToolCallContent::Diff(
+                        acp::Diff::new(&path, "fn after() {}\n").old_text("fn before() {}\n"),
+                    )])
+                    .locations(vec![acp::ToolCallLocation::new(&path)]),
+            ));
+        }
+
+        let subagent_session_info = acp_thread::SubagentSessionInfo {
+            session_id: subagent_session_id.clone(),
+            message_start_index: 0,
+            message_end_index: Some(1),
+        };
+        history.push(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("historical-subagent-call", "Research in a subagent")
+                .status(acp::ToolCallStatus::Completed)
+                .meta(acp::Meta::from_iter([(
+                    acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                    serde_json::to_value(subagent_session_info)
+                        .expect("subagent session info should serialize"),
+                )])),
+        ));
+        server.set_load_session_updates(root_session_id.clone(), history);
+        server.set_load_session_updates(
+            subagent_session_id.clone(),
+            vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("Subagent history loaded on demand".into()),
+            )],
+        );
+
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let thread_store = cx.update(|_window, cx| cx.new(ThreadStore::new));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(server),
+                    connection_store,
+                    Agent::Custom { id: "Test".into() },
+                    Some(root_session_id.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project.clone(),
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        assert_eq!(
+            load_session_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "restoring the parent session must not eagerly load historical subagents"
+        );
+        conversation_view.read_with(cx, |view, cx| {
+            let connected = view.as_connected().expect("session should finish loading");
+            assert_eq!(connected.threads.len(), 1);
+            let active_thread = view.active_thread().expect("root thread should be active");
+            let active_thread = active_thread.read(cx);
+            assert_eq!(
+                active_thread.thread.read(cx).entries().len(),
+                HISTORICAL_DIFF_COUNT + 1
+            );
+            assert_thread_list_item_count_matches_entries(active_thread, cx);
+
+            let entry_view_state = active_thread.entry_view_state.read(cx);
+            for (index, entry) in active_thread
+                .thread
+                .read(cx)
+                .entries()
+                .iter()
+                .take(HISTORICAL_DIFF_COUNT)
+                .enumerate()
+            {
+                let diff = entry
+                    .diffs()
+                    .next()
+                    .expect("every historical edit should retain its diff");
+                assert!(
+                    !diff.read(cx).is_materialized(),
+                    "historical diff {index} should stay unloaded while collapsed"
+                );
+                assert!(
+                    entry_view_state
+                        .entry(index)
+                        .and_then(|entry| entry.editor_for_diff(diff))
+                        .is_none(),
+                    "historical diff {index} should not allocate an editor while collapsed"
+                );
+                let (_, resolved_location) = entry
+                    .location(0)
+                    .expect("historical location should remain visible in the card");
+                assert!(
+                    resolved_location.is_none(),
+                    "historical location {index} should not open a buffer during replay"
+                );
+            }
+        });
+        project.read_with(cx, |project, cx| {
+            assert_eq!(
+                project.worktrees(cx).count(),
+                0,
+                "history replay should not create worktrees for historical locations"
+            );
+        });
+
+        let selected_index = HISTORICAL_DIFF_COUNT / 2;
+        let selected_tool_call_id =
+            acp::ToolCallId::new(format!("historical-edit-{selected_index}"));
+        let root_thread = active_thread(&conversation_view, cx);
+        root_thread.update_in(cx, |thread_view, window, cx| {
+            let thread = thread_view.thread.clone();
+            thread_view.entry_view_state.update(cx, |state, cx| {
+                state.expand_tool_call(selected_tool_call_id);
+                state.sync_entry(selected_index, &thread, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        root_thread.read_with(cx, |thread_view, cx| {
+            let thread = thread_view.thread.read(cx);
+            let entry_view_state = thread_view.entry_view_state.read(cx);
+            for (index, entry) in thread
+                .entries()
+                .iter()
+                .take(HISTORICAL_DIFF_COUNT)
+                .enumerate()
+            {
+                let diff = entry.diffs().next().expect("historical diff should exist");
+                assert_eq!(
+                    diff.read(cx).is_materialized(),
+                    index == selected_index,
+                    "expanding one card should materialize exactly that card"
+                );
+                assert_eq!(
+                    entry_view_state
+                        .entry(index)
+                        .and_then(|entry| entry.editor_for_diff(diff))
+                        .is_some(),
+                    index == selected_index,
+                    "expanding one card should create exactly one diff editor"
+                );
+            }
+        });
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            root_thread.update(cx, |thread_view, cx| {
+                thread_view.entry_view_state.update(cx, |state, _cx| {
+                    state.expand_tool_call(acp::ToolCallId::new("historical-subagent-call"));
+                });
+            });
+            view.load_subagent_session(subagent_session_id.clone(), root_session_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            load_session_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "expanding the historical subagent should issue one on-demand load"
+        );
+        conversation_view.read_with(cx, |view, cx| {
+            let connected = view.as_connected().expect("server should remain connected");
+            assert_eq!(connected.threads.len(), 2);
+            let subagent_view = connected
+                .threads
+                .get(&subagent_session_id)
+                .expect("expanded subagent should be registered");
+            assert_eq!(subagent_view.read(cx).thread.read(cx).entries().len(), 1);
         });
     }
 

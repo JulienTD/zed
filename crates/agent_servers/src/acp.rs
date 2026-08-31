@@ -1169,6 +1169,7 @@ impl AcpConnection {
         project: Entity<Project>,
         work_dirs: PathList,
         title: Option<SharedString>,
+        replay_history: bool,
         rpc_call: impl FnOnce(
             ConnectionTo<Agent>,
             acp::SessionId,
@@ -1211,7 +1212,7 @@ impl AcpConnection {
                 async move |cx| {
                     let action_log = cx.new(|_| ActionLog::new(project.clone()));
                     let thread: Entity<AcpThread> = cx.new(|cx| {
-                        AcpThread::new(
+                        let mut thread = AcpThread::new(
                             None,
                             title,
                             Some(work_dirs),
@@ -1223,7 +1224,11 @@ impl AcpConnection {
                                 this.agent_capabilities.prompt_capabilities.clone(),
                             ),
                             cx,
-                        )
+                        );
+                        if replay_history {
+                            thread.begin_history_replay();
+                        }
+                        thread
                     });
 
                     // Register the session before awaiting the RPC so that any
@@ -1255,6 +1260,10 @@ impl AcpConnection {
 
                     let (modes, config_options) =
                         config_state(response.modes, response.config_options);
+
+                    if replay_history {
+                        thread.update(cx, |thread, _cx| thread.finish_history_replay());
+                    }
 
                     if let Some(config_opts) = config_options.as_ref() {
                         this.apply_default_config_options(&session_id, config_opts, cx);
@@ -1746,6 +1755,7 @@ impl AgentConnection for AcpConnection {
             project,
             work_dirs,
             title,
+            true,
             move |connection, session_id, directories| {
                 Box::pin(async move {
                     let response = connection
@@ -1790,6 +1800,7 @@ impl AgentConnection for AcpConnection {
             project,
             work_dirs,
             title,
+            false,
             move |connection, session_id, directories| {
                 Box::pin(async move {
                     let response = connection
@@ -2099,6 +2110,7 @@ pub mod test_support {
     #[derive(Clone, Default)]
     pub struct FakeAcpAgentServer {
         load_session_count: Arc<AtomicUsize>,
+        load_session_updates: Arc<Mutex<HashMap<acp::SessionId, Vec<acp::SessionUpdate>>>>,
         close_session_count: Arc<AtomicUsize>,
         fail_next_prompt: Arc<AtomicBool>,
         auth_elicitation_request: Arc<Mutex<Option<acp::CreateElicitationRequest>>>,
@@ -2116,6 +2128,17 @@ pub mod test_support {
 
         pub fn load_session_count(&self) -> Arc<AtomicUsize> {
             self.load_session_count.clone()
+        }
+
+        pub fn set_load_session_updates(
+            &self,
+            session_id: acp::SessionId,
+            updates: Vec<acp::SessionUpdate>,
+        ) {
+            self.load_session_updates
+                .lock()
+                .expect("load session updates lock should not be poisoned")
+                .insert(session_id, updates);
         }
 
         pub fn close_session_count(&self) -> Arc<AtomicUsize> {
@@ -2172,6 +2195,7 @@ pub mod test_support {
             cx: &mut App,
         ) -> Task<anyhow::Result<Rc<dyn AgentConnection>>> {
             let load_session_count = self.load_session_count.clone();
+            let load_session_updates = self.load_session_updates.clone();
             let close_session_count = self.close_session_count.clone();
             let fail_next_prompt = self.fail_next_prompt.clone();
             let auth_elicitation_request = self.auth_elicitation_request.clone();
@@ -2182,6 +2206,7 @@ pub mod test_support {
                 let harness = build_fake_acp_connection(
                     project,
                     load_session_count,
+                    load_session_updates,
                     close_session_count,
                     fail_next_prompt,
                     auth_elicitation_request,
@@ -2410,6 +2435,7 @@ pub mod test_support {
     async fn build_fake_acp_connection(
         project: Entity<Project>,
         load_session_count: Arc<AtomicUsize>,
+        load_session_updates: Arc<Mutex<HashMap<acp::SessionId, Vec<acp::SessionUpdate>>>>,
         close_session_count: Arc<AtomicUsize>,
         fail_next_prompt: Arc<AtomicBool>,
         auth_elicitation_request: Arc<Mutex<Option<acp::CreateElicitationRequest>>>,
@@ -2506,8 +2532,20 @@ pub mod test_support {
             .on_receive_request(
                 {
                     let load_session_count = load_session_count.clone();
-                    async move |_req: acp::LoadSessionRequest, responder, _cx| {
+                    let load_session_updates = load_session_updates.clone();
+                    async move |req: acp::LoadSessionRequest, responder, cx| {
                         load_session_count.fetch_add(1, Ordering::SeqCst);
+                        let updates = load_session_updates
+                            .lock()
+                            .expect("load session updates lock should not be poisoned")
+                            .remove(&req.session_id)
+                            .unwrap_or_default();
+                        for update in updates {
+                            cx.send_notification(acp::SessionNotification::new(
+                                req.session_id.clone(),
+                                update,
+                            ))?;
+                        }
                         responder.respond(acp::LoadSessionResponse::new())
                     }
                 },
@@ -2625,6 +2663,7 @@ pub mod test_support {
         build_fake_acp_connection(
             project,
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(HashMap::default())),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
@@ -2654,6 +2693,7 @@ pub mod test_support {
         let harness = build_fake_acp_connection(
             project,
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(HashMap::default())),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(Some(request))),
@@ -2686,6 +2726,7 @@ pub mod test_support {
         let harness = build_fake_acp_connection(
             project,
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(HashMap::default())),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(Some(request))),
@@ -3842,7 +3883,11 @@ mod tests {
         });
 
         let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        fs.insert_tree(
+            "/",
+            serde_json::json!({ "a": { "history.rs": "fn historical() {}" } }),
+        )
+        .await;
         let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
 
         let load_count = Arc::new(AtomicUsize::new(0));
@@ -4148,6 +4193,11 @@ mod tests {
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
                 acp::TextContent::new(String::from("hi user")),
             ))),
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("historical-tool-call", "Read history.rs")
+                    .status(acp::ToolCallStatus::Completed)
+                    .locations(vec![acp::ToolCallLocation::new("/a/history.rs")]),
+            ),
         ];
 
         let session_id = acp::SessionId::new("session-replay");
@@ -4184,9 +4234,18 @@ mod tests {
 
         assert_eq!(
             entries,
-            vec!["user", "assistant"],
+            vec!["user", "assistant", "tool_call"],
             "replayed notifications should be applied to the thread"
         );
+        thread.read_with(cx, |thread, _cx| {
+            let (_, resolved_location) = thread.entries()[2]
+                .location(0)
+                .expect("historical tool-call location should be retained");
+            assert!(
+                resolved_location.is_none(),
+                "historical tool-call locations should not open buffers during replay"
+            );
+        });
     }
 
     // Regression test: if `close_session` is issued while a `load_session`
