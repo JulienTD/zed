@@ -285,22 +285,30 @@ impl EntryViewState {
                 let id = tool_call.id.clone();
                 let terminals = tool_call.terminals().cloned().collect::<Vec<_>>();
                 let diffs = tool_call.diffs().cloned().collect::<Vec<_>>();
+                let should_materialize_diffs = self.expanded_tool_calls.contains(&id);
 
-                let views = if let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) {
-                    &mut tool_call.content
-                } else {
-                    self.set_entry(
-                        index,
-                        Entry::ToolCall(ToolCallEntry {
-                            content: HashMap::default(),
-                            focus_handle: cx.focus_handle(),
-                        }),
-                    );
-                    let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) else {
-                        unreachable!()
+                let tool_call_entry =
+                    if let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) {
+                        tool_call
+                    } else {
+                        self.set_entry(
+                            index,
+                            Entry::ToolCall(ToolCallEntry {
+                                content: HashMap::default(),
+                                known_diffs: HashSet::default(),
+                                focus_handle: cx.focus_handle(),
+                            }),
+                        );
+                        let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) else {
+                            unreachable!()
+                        };
+                        tool_call
                     };
-                    &mut tool_call.content
-                };
+                let ToolCallEntry {
+                    content: views,
+                    known_diffs,
+                    ..
+                } = tool_call_entry;
 
                 let is_tool_call_completed =
                     matches!(tool_call.status, acp_thread::ToolCallStatus::Completed);
@@ -334,50 +342,50 @@ impl EntryViewState {
                 }
 
                 for diff in diffs {
-                    views.entry(diff.entity_id()).or_insert_with(|| {
-                        let editor = create_editor_diff(diff.clone(), window, cx);
-                        cx.subscribe(&editor, {
-                            let diff = diff.clone();
-                            let entry_index = index;
-                            move |_this, _editor, event: &EditorEvent, cx| {
-                                if let EditorEvent::OpenExcerptsRequested {
-                                    selections_by_buffer,
-                                    split,
-                                } = event
-                                {
-                                    let multibuffer = diff.read(cx).multibuffer();
-                                    if let Some((buffer_id, (ranges, _))) =
-                                        selections_by_buffer.iter().next()
-                                    {
-                                        if let Some(buffer) =
-                                            multibuffer.read(cx).buffer(*buffer_id)
-                                        {
-                                            if let Some(range) = ranges.first() {
-                                                let point =
-                                                    buffer.read(cx).offset_to_point(range.start.0);
-                                                if let Some(path) = diff.read(cx).file_path(cx) {
-                                                    cx.emit(EntryViewEvent {
-                                                        entry_index,
-                                                        view_event: ViewEvent::OpenDiffLocation {
-                                                            path,
-                                                            position: point,
-                                                            split: *split,
-                                                        },
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        })
-                        .detach();
+                    if known_diffs.insert(diff.entity_id()) {
                         cx.emit(EntryViewEvent {
                             entry_index: index,
                             view_event: ViewEvent::NewDiff(id.clone()),
                         });
-                        editor.into_any()
-                    });
+                    }
+
+                    if !should_materialize_diffs || views.contains_key(&diff.entity_id()) {
+                        continue;
+                    }
+
+                    let Some(editor) = create_editor_diff(diff.clone(), window, cx) else {
+                        continue;
+                    };
+                    cx.subscribe(&editor, {
+                        let diff = diff.clone();
+                        let entry_index = index;
+                        move |_this, _editor, event: &EditorEvent, cx| {
+                            if let EditorEvent::OpenExcerptsRequested {
+                                selections_by_buffer,
+                                split,
+                            } = event
+                                && let Some(multibuffer) = diff.read(cx).multibuffer()
+                                && let Some((buffer_id, (ranges, _))) =
+                                    selections_by_buffer.iter().next()
+                                && let Some(buffer) = multibuffer.read(cx).buffer(*buffer_id)
+                                && let Some(range) = ranges.first()
+                            {
+                                let point = buffer.read(cx).offset_to_point(range.start.0);
+                                if let Some(path) = diff.read(cx).file_path(cx) {
+                                    cx.emit(EntryViewEvent {
+                                        entry_index,
+                                        view_event: ViewEvent::OpenDiffLocation {
+                                            path,
+                                            position: point,
+                                            split: *split,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    })
+                    .detach();
+                    views.insert(diff.entity_id(), editor.into_any());
                 }
             }
             AgentThreadEntry::Elicitation(_) => {
@@ -527,6 +535,7 @@ impl AssistantMessageEntry {
 #[derive(Debug)]
 pub struct ToolCallEntry {
     content: HashMap<EntityId, AnyEntity>,
+    known_diffs: HashSet<EntityId>,
     focus_handle: FocusHandle,
 }
 
@@ -656,15 +665,17 @@ fn create_editor_diff(
     diff: Entity<acp_thread::Diff>,
     window: &mut Window,
     cx: &mut App,
-) -> Entity<Editor> {
-    cx.new(|cx| {
+) -> Option<Entity<Editor>> {
+    diff.update(cx, |diff, cx| diff.materialize(cx));
+    let multibuffer = diff.read(cx).multibuffer()?.clone();
+    Some(cx.new(|cx| {
         let mut editor = Editor::new(
             EditorMode::Full {
                 scale_ui_elements_with_buffer_font_size: false,
                 show_active_line_background: false,
                 sizing_behavior: SizingBehavior::SizeByContent,
             },
-            diff.read(cx).multibuffer().clone(),
+            multibuffer,
             None,
             window,
             cx,
@@ -688,7 +699,7 @@ fn create_editor_diff(
         editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyUnstagedDiffHunkDelegate)), cx);
         editor.set_text_style_refinement(diff_editor_text_style_refinement(cx));
         editor
-    })
+    }))
 }
 
 fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
@@ -810,7 +821,24 @@ mod tests {
                 .clone()
         });
 
+        assert!(!diff.read_with(cx, |diff, _cx| diff.is_materialized()));
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(
+                view_state
+                    .entry(0)
+                    .and_then(|entry| entry.editor_for_diff(&diff))
+                    .is_none()
+            );
+        });
+
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.expand_tool_call(acp::ToolCallId::new("tool"));
+            view_state.sync_entry(0, &thread, window, cx);
+        });
+
         cx.run_until_parked();
+
+        assert!(diff.read_with(cx, |diff, _cx| diff.is_materialized()));
 
         let diff_editor = view_state.read_with(cx, |view_state, _cx| {
             view_state.entry(0).unwrap().editor_for_diff(&diff).unwrap()

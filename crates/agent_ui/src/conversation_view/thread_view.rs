@@ -1267,8 +1267,10 @@ impl ThreadView {
         match &event.view_event {
             ViewEvent::NewDiff(tool_call_id) => {
                 if AgentSettings::get_global(cx).expand_edit_card {
-                    self.entry_view_state.update(cx, |state, _cx| {
+                    let thread = self.thread.clone();
+                    self.entry_view_state.update(cx, |state, cx| {
                         state.expand_tool_call(tool_call_id.clone());
+                        state.sync_entry(event.entry_index, &thread, window, cx);
                     });
                 }
             }
@@ -8514,13 +8516,26 @@ impl ThreadView {
                                                                   _,
                                                                   window,
                                                                   cx: &mut Context<Self>| {
+                                                                let thread = this.thread.clone();
                                                                 this.entry_view_state.update(
                                                                     cx,
-                                                                    |state, _cx| {
+                                                                    |state, cx| {
                                                                         state
                                                                             .toggle_tool_call_expansion(
                                                                                 &id,
                                                                             );
+                                                                        if state
+                                                                            .is_tool_call_expanded(
+                                                                                &id,
+                                                                            )
+                                                                        {
+                                                                            state.sync_entry(
+                                                                                entry_ix,
+                                                                                &thread,
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                        }
                                                                     },
                                                                 );
                                                                 this.refresh_thread_search(window, cx);
@@ -8582,8 +8597,11 @@ impl ThreadView {
                                                                     let base_text = diff_data
                                                                         .base_text()
                                                                         .clone();
-                                                                    let buffer =
-                                                                        diff_data.buffer().clone();
+                                                                    let Some(buffer) =
+                                                                        diff_data.buffer().cloned()
+                                                                    else {
+                                                                        return;
+                                                                    };
                                                                     buffer.update(
                                                                         cx,
                                                                         |buffer, cx| {
@@ -10153,7 +10171,8 @@ impl ThreadView {
 
                 active_editor.update_in(cx, |editor, window, cx| {
                     let snapshot = editor.buffer().read(cx).snapshot(cx);
-                    if snapshot.as_singleton().is_some()
+                    if let Some(agent_location) = agent_location
+                        && snapshot.as_singleton().is_some()
                         && let Some(anchor) = snapshot.anchor_in_excerpt(agent_location.position)
                     {
                         editor.change_selections(Default::default(), window, cx, |selections| {
@@ -10563,7 +10582,13 @@ impl ThreadView {
             .map(|view| view.read(cx).thread.clone());
         let subagent_session_id = thread
             .as_ref()
-            .map(|thread| thread.read(cx).session_id().clone());
+            .map(|thread| thread.read(cx).session_id().clone())
+            .or_else(|| {
+                tool_call
+                    .subagent_session_info
+                    .as_ref()
+                    .map(|info| info.session_id.clone())
+            });
         let action_log = thread.as_ref().map(|thread| thread.read(cx).action_log());
         let changed_buffers = action_log
             .map(|log| log.read(cx).changed_buffers(cx).collect::<Vec<_>>())
@@ -10663,9 +10688,20 @@ impl ThreadView {
                 .into_any_element()
         });
 
-        let has_expandable_content = thread
-            .as_ref()
-            .map_or(false, |thread| !thread.read(cx).entries().is_empty());
+        let can_load_subagent = self
+            .server_view
+            .upgrade()
+            .and_then(|server_view| {
+                server_view
+                    .read(cx)
+                    .as_connected()
+                    .map(|connected| connected.connection.supports_load_session())
+            })
+            .unwrap_or(false);
+        let has_expandable_content = thread.as_ref().map_or(
+            can_load_subagent && subagent_session_id.is_some(),
+            |thread| !thread.read(cx).entries().is_empty(),
+        );
 
         let tooltip_meta_description = if is_expanded {
             "Click to Collapse"
@@ -10761,12 +10797,33 @@ impl ThreadView {
                                     )
                                     .on_click(cx.listener({
                                         let tool_call_id = tool_call.id.clone();
+                                        let subagent_session_id = thread
+                                            .is_none()
+                                            .then(|| subagent_session_id.clone())
+                                            .flatten();
+                                        let parent_session_id =
+                                            self.thread.read(cx).session_id().clone();
                                         move |this, _, window, cx| {
                                             let expanded =
                                                 this.entry_view_state.update(cx, |state, _cx| {
                                                     state.toggle_tool_call_expansion(&tool_call_id);
                                                     state.is_tool_call_expanded(&tool_call_id)
                                                 });
+                                            if expanded
+                                                && let Some(subagent_session_id) =
+                                                    subagent_session_id.clone()
+                                            {
+                                                this.server_view
+                                                    .update(cx, |server_view, cx| {
+                                                        server_view.load_subagent_session(
+                                                            subagent_session_id,
+                                                            parent_session_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .log_err();
+                                            }
                                             this.refresh_thread_search(window, cx);
                                             telemetry::event!("Subagent Toggled", expanded);
                                             cx.notify();

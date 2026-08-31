@@ -10,12 +10,28 @@ use std::{cmp::Reverse, ops::Range, path::Path, sync::Arc};
 use util::ResultExt;
 
 pub enum Diff {
+    Unloaded(UnloadedDiff),
     Pending(PendingDiff),
     Finalized(FinalizedDiff),
 }
 
 impl Diff {
-    pub fn finalized(
+    pub fn unloaded(
+        path: String,
+        old_text: Option<String>,
+        new_text: String,
+        language_registry: Arc<LanguageRegistry>,
+    ) -> Self {
+        Self::Unloaded(UnloadedDiff {
+            path,
+            base_text_exists: old_text.is_some(),
+            base_text: old_text.unwrap_or_default().into(),
+            new_text,
+            language_registry,
+        })
+    }
+
+    fn finalized(
         path: String,
         old_text: Option<String>,
         new_text: String,
@@ -84,6 +100,25 @@ impl Diff {
         })
     }
 
+    pub fn materialize(&mut self, cx: &mut Context<Self>) {
+        let Self::Unloaded(unloaded) = self else {
+            return;
+        };
+
+        let path = std::mem::take(&mut unloaded.path);
+        let old_text = unloaded
+            .base_text_exists
+            .then(|| unloaded.base_text.to_string());
+        let new_text = std::mem::take(&mut unloaded.new_text);
+        let language_registry = unloaded.language_registry.clone();
+        *self = Self::finalized(path, old_text, new_text, language_registry, cx);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_materialized(&self) -> bool {
+        !matches!(self, Self::Unloaded(_))
+    }
+
     pub fn new(buffer: Entity<Buffer>, cx: &mut Context<Self>) -> Self {
         let buffer_text_snapshot = buffer.read(cx).text_snapshot();
         let language = buffer.read(cx).language().cloned();
@@ -134,21 +169,24 @@ impl Diff {
     /// Returns the original text before any edits were applied.
     pub fn base_text(&self) -> &Arc<str> {
         match self {
+            Self::Unloaded(UnloadedDiff { base_text, .. }) => base_text,
             Self::Pending(PendingDiff { base_text, .. }) => base_text,
             Self::Finalized(FinalizedDiff { base_text, .. }) => base_text,
         }
     }
 
     /// Returns the buffer being edited (for pending diffs) or the snapshot buffer (for finalized diffs).
-    pub fn buffer(&self) -> &Entity<Buffer> {
+    pub fn buffer(&self) -> Option<&Entity<Buffer>> {
         match self {
-            Self::Pending(PendingDiff { new_buffer, .. }) => new_buffer,
-            Self::Finalized(FinalizedDiff { new_buffer, .. }) => new_buffer,
+            Self::Unloaded(_) => None,
+            Self::Pending(PendingDiff { new_buffer, .. }) => Some(new_buffer),
+            Self::Finalized(FinalizedDiff { new_buffer, .. }) => Some(new_buffer),
         }
     }
 
     pub fn file_path(&self, cx: &App) -> Option<String> {
         match self {
+            Self::Unloaded(UnloadedDiff { path, .. }) => Some(path.clone()),
             Self::Pending(PendingDiff { new_buffer, .. }) => new_buffer
                 .read(cx)
                 .file()
@@ -157,22 +195,30 @@ impl Diff {
         }
     }
 
-    pub fn multibuffer(&self) -> &Entity<MultiBuffer> {
+    pub fn multibuffer(&self) -> Option<&Entity<MultiBuffer>> {
         match self {
-            Self::Pending(PendingDiff { multibuffer, .. }) => multibuffer,
-            Self::Finalized(FinalizedDiff { multibuffer, .. }) => multibuffer,
+            Self::Unloaded(_) => None,
+            Self::Pending(PendingDiff { multibuffer, .. }) => Some(multibuffer),
+            Self::Finalized(FinalizedDiff { multibuffer, .. }) => Some(multibuffer),
         }
     }
 
     pub fn to_markdown(&self, cx: &App) -> String {
-        let buffer_text = self
-            .multibuffer()
+        if let Self::Unloaded(UnloadedDiff { path, new_text, .. }) = self {
+            return format!("Diff: {path}\n```\n{new_text}\n```\n");
+        }
+
+        let Some(multibuffer) = self.multibuffer() else {
+            return String::new();
+        };
+        let buffer_text = multibuffer
             .read(cx)
             .all_buffers()
             .iter()
             .map(|buffer| buffer.read(cx).text())
             .join("\n");
         let path = match self {
+            Diff::Unloaded(_) => None,
             Diff::Pending(PendingDiff {
                 new_buffer: buffer, ..
             }) => buffer
@@ -189,11 +235,17 @@ impl Diff {
     }
 
     pub fn has_revealed_range(&self, cx: &App) -> bool {
-        !self.multibuffer().read(cx).is_empty()
+        self.multibuffer()
+            .is_some_and(|multibuffer| !multibuffer.read(cx).is_empty())
     }
 
     pub fn needs_update(&self, old_text: &str, new_text: &str, cx: &App) -> bool {
         match self {
+            Diff::Unloaded(UnloadedDiff {
+                base_text,
+                new_text: current_new_text,
+                ..
+            }) => base_text.as_ref() != old_text || current_new_text != new_text,
             Diff::Pending(PendingDiff {
                 base_text,
                 new_buffer,
@@ -212,6 +264,14 @@ impl Diff {
             }
         }
     }
+}
+
+pub struct UnloadedDiff {
+    path: String,
+    base_text_exists: bool,
+    base_text: Arc<str>,
+    new_text: String,
+    language_registry: Arc<LanguageRegistry>,
 }
 
 pub struct PendingDiff {
@@ -295,7 +355,10 @@ impl PendingDiff {
         let update_diff = cx.spawn(async move |this, cx| {
             let buffer_diff = buffer_diff.await?;
             this.update(cx, |this, cx| {
-                this.multibuffer().update(cx, |multibuffer, cx| {
+                let Some(multibuffer) = this.multibuffer().cloned() else {
+                    return;
+                };
+                multibuffer.update(cx, |multibuffer, cx| {
                     let path_key = PathKey::for_buffer(&buffer, cx);
                     multibuffer.clear(cx);
                     multibuffer.set_excerpts_for_path(

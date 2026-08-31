@@ -853,6 +853,36 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_replayed_diff_is_unloaded(cx: &mut TestAppContext) {
+        let (write_tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({ "main.rs": "old content" })).await;
+        let (event_stream, mut event_receiver) = ToolCallEventStream::test();
+
+        cx.update(|cx| {
+            write_tool.replay(
+                WriteFileToolInput {
+                    path: "root/main.rs".into(),
+                    content: "new content".into(),
+                },
+                EditSessionOutput::Success {
+                    input_path: "root/main.rs".into(),
+                    old_text: Arc::new("old content".into()),
+                    new_text: "new content".into(),
+                    diff: String::new(),
+                },
+                event_stream,
+                cx,
+            )
+        })
+        .unwrap();
+
+        let diff = event_receiver.expect_diff().await;
+        diff.read_with(cx, |diff, _cx| {
+            assert!(matches!(diff, Diff::Unloaded(_)));
+        });
+    }
+
+    #[gpui::test]
     async fn test_streaming_create_content_streamed(cx: &mut TestAppContext) {
         let (write_tool, project, _action_log, _fs, _thread) =
             setup_test(cx, json!({"dir": {}})).await;

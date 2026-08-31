@@ -839,7 +839,7 @@ impl AgentThreadEntry {
         }
     }
 
-    pub fn location(&self, ix: usize) -> Option<(acp::ToolCallLocation, AgentLocation)> {
+    pub fn location(&self, ix: usize) -> Option<(acp::ToolCallLocation, Option<AgentLocation>)> {
         if let AgentThreadEntry::ToolCall(ToolCall {
             locations,
             resolved_locations,
@@ -848,7 +848,7 @@ impl AgentThreadEntry {
         {
             Some((
                 locations.get(ix)?.clone(),
-                resolved_locations.get(ix)?.clone()?,
+                resolved_locations.get(ix).cloned().flatten(),
             ))
         } else {
             None
@@ -1828,13 +1828,12 @@ impl ToolCallContent {
                     cx,
                 )),
             )),
-            acp::ToolCallContent::Diff(diff) => Ok(Some(Self::Diff(cx.new(|cx| {
-                Diff::finalized(
+            acp::ToolCallContent::Diff(diff) => Ok(Some(Self::Diff(cx.new(|_cx| {
+                Diff::unloaded(
                     diff.path.to_string_lossy().into_owned(),
                     diff.old_text,
                     diff.new_text,
                     language_registry,
-                    cx,
                 )
             })))),
             acp::ToolCallContent::Terminal(acp::Terminal { terminal_id, .. }) => terminals
@@ -2121,6 +2120,7 @@ pub struct AcpThread {
     /// gradually to create a fluid typing effect instead of choppy chunk-at-a-time
     /// updates.
     streaming_text_buffer: Option<StreamingTextBuffer>,
+    is_replaying_history: bool,
 }
 
 struct StreamingTextBuffer {
@@ -2328,7 +2328,16 @@ impl AcpThread {
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
+            is_replaying_history: false,
         }
+    }
+
+    pub fn begin_history_replay(&mut self) {
+        self.is_replaying_history = true;
+    }
+
+    pub fn finish_history_replay(&mut self) {
+        self.is_replaying_history = false;
     }
 
     pub fn parent_session_id(&self) -> Option<&acp::SessionId> {
@@ -3166,7 +3175,7 @@ impl AcpThread {
                     &self.terminals,
                     cx,
                 )?;
-                if location_updated {
+                if location_updated && !self.is_replaying_history {
                     self.resolve_locations(update.tool_call_id, cx);
                 }
             }
@@ -3253,7 +3262,9 @@ impl AcpThread {
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
         };
 
-        self.resolve_locations(id, cx);
+        if !self.is_replaying_history {
+            self.resolve_locations(id, cx);
+        }
         Ok(())
     }
 
@@ -6391,10 +6402,64 @@ mod tests {
             assert_eq!(tool_call_location.path, skill_path);
 
             let buffer = agent_location
+                .expect("external tool-call location should have an anchor")
                 .buffer
                 .upgrade()
                 .expect("resolved location should keep an open buffer");
             assert_eq!(buffer.read(cx).text(), "skill body");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_history_replay_defers_external_tool_call_locations(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/tmp/skills/test-skill"),
+            json!({ "SKILL.md": "skill body" }),
+        )
+        .await;
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/project"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let skill_path = std::path::PathBuf::from(path!("/tmp/skills/test-skill/SKILL.md"));
+        thread
+            .update(cx, |thread, cx| {
+                thread.begin_history_replay();
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new("write_file", "Write SKILL.md")
+                            .kind(acp::ToolKind::Edit)
+                            .status(acp::ToolCallStatus::Completed)
+                            .locations(vec![acp::ToolCallLocation::new(skill_path.clone())]),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            let (tool_call_location, agent_location) = thread.entries[0]
+                .location(0)
+                .expect("replayed tool-call location should remain available");
+            assert_eq!(tool_call_location.path, skill_path);
+            assert!(agent_location.is_none());
+        });
+        project.read_with(cx, |project, cx| {
+            assert_eq!(project.worktrees(cx).count(), 0);
         });
     }
 
