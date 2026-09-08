@@ -2153,12 +2153,23 @@ impl Sidebar {
             .collect();
 
         for cv in draft_conversation_views {
+            let thread_id = cv.read(cx).parent_id();
             if let Some(thread_view) = cv.read(cx).active_thread() {
                 let editor = thread_view.read(cx).message_editor.clone();
                 self._draft_editor_observations.push(cx.subscribe(
                     &editor,
-                    |this, _editor, event, cx| match event {
-                        MessageEditorEvent::Edited => this.schedule_update_entries(false, cx),
+                    move |this, _editor, event, cx| match event {
+                        MessageEditorEvent::Edited => {
+                            // Only draft rows derive their title from the composer. Editing
+                            // a reply in an existing thread does not change the sidebar.
+                            if ThreadMetadataStore::global(cx)
+                                .read(cx)
+                                .entry(thread_id)
+                                .is_none_or(|metadata| metadata.is_draft())
+                            {
+                                this.schedule_update_entries(false, cx);
+                            }
+                        }
                         _ => (),
                     },
                 ));

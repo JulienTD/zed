@@ -3,8 +3,8 @@ use fs::Fs;
 
 use gpui::{
     AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, WeakEntity, Window,
-    WindowId, actions, deferred, px,
+    ManagedView, MouseButton, Pixels, Render, StyleRefinement, Subscription, Task, TaskExt,
+    WeakEntity, Window, WindowId, actions, deferred, px,
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
@@ -2051,7 +2051,11 @@ impl Render for MultiWorkspace {
                     .h_full()
                     .w(sidebar_width)
                     .flex_shrink_0()
-                    .child(sidebar_handle.to_any())
+                    .child(
+                        sidebar_handle
+                            .to_any()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
                     .child(resize_handle)
                     .into_any_element()
             })

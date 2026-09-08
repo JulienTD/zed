@@ -38,7 +38,7 @@ use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
 use scheduler::Instant;
@@ -487,7 +487,27 @@ impl ArenaClearNeeded {
     }
 }
 
-pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
+#[derive(Default)]
+pub(crate) struct FocusMap {
+    entries: RwLock<SlotMap<FocusId, FocusRef>>,
+    dropped: Mutex<Vec<FocusId>>,
+}
+
+impl FocusMap {
+    pub(crate) fn take_dropped(&self) -> Vec<FocusId> {
+        // Release the queue lock before acquiring the map lock: the final handle
+        // drop enqueues its ID while holding a map read lock.
+        let dropped = mem::take(&mut *self.dropped.lock());
+        if !dropped.is_empty() {
+            let mut handles = self.entries.write();
+            for id in &dropped {
+                handles.remove(*id);
+            }
+        }
+        dropped
+    }
+}
+
 pub(crate) struct FocusRef {
     pub(crate) ref_count: AtomicUsize,
     pub(crate) tab_index: isize,
@@ -542,7 +562,7 @@ impl std::fmt::Debug for FocusHandle {
 
 impl FocusHandle {
     pub(crate) fn new(handles: &Arc<FocusMap>) -> Self {
-        let id = handles.write().insert(FocusRef {
+        let id = handles.entries.write().insert(FocusRef {
             ref_count: AtomicUsize::new(1),
             tab_index: 0,
             tab_stop: false,
@@ -557,7 +577,7 @@ impl FocusHandle {
     }
 
     pub(crate) fn for_id(id: FocusId, handles: &Arc<FocusMap>) -> Option<Self> {
-        let lock = handles.read();
+        let lock = handles.entries.read();
         let focus = lock.get(id)?;
         if atomic_incr_if_not_zero(&focus.ref_count) == 0 {
             return None;
@@ -573,7 +593,7 @@ impl FocusHandle {
     /// Sets the tab index of the element associated with this handle.
     pub fn tab_index(mut self, index: isize) -> Self {
         self.tab_index = index;
-        if let Some(focus) = self.handles.write().get_mut(self.id) {
+        if let Some(focus) = self.handles.entries.write().get_mut(self.id) {
             focus.tab_index = index;
         }
         self
@@ -584,7 +604,7 @@ impl FocusHandle {
     /// When `false`, the element will not be included in the tab order.
     pub fn tab_stop(mut self, tab_stop: bool) -> Self {
         self.tab_stop = tab_stop;
-        if let Some(focus) = self.handles.write().get_mut(self.id) {
+        if let Some(focus) = self.handles.entries.write().get_mut(self.id) {
             focus.tab_stop = tab_stop;
         }
         self
@@ -653,12 +673,16 @@ impl Eq for FocusHandle {}
 
 impl Drop for FocusHandle {
     fn drop(&mut self) {
-        self.handles
-            .read()
+        let handles = self.handles.entries.read();
+        if handles
             .get(self.id)
-            .unwrap()
+            .expect("live focus handle must be registered")
             .ref_count
-            .fetch_sub(1, SeqCst);
+            .fetch_sub(1, SeqCst)
+            == 1
+        {
+            self.handles.dropped.lock().push(self.id);
+        }
     }
 }
 
@@ -7393,6 +7417,116 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
+
+    #[test]
+    fn test_focus_cleanup_preserves_live_handles_and_rejects_dead_weak_handles() {
+        let map = std::sync::Arc::new(super::FocusMap::default());
+        let handle = FocusHandle::new(&map).tab_index(7).tab_stop(true);
+        let weak = handle.downgrade();
+        let clone = handle.clone();
+        drop(handle);
+        assert!(map.take_dropped().is_empty());
+        let upgraded = weak.upgrade().unwrap();
+        assert_eq!(upgraded.tab_index, 7);
+        assert!(upgraded.tab_stop);
+        drop(upgraded);
+        let old_id = clone.id;
+        drop(clone);
+        assert!(
+            weak.upgrade().is_none(),
+            "A zero-reference handle cannot be resurrected before cleanup"
+        );
+        assert_eq!(map.take_dropped(), vec![old_id]);
+        assert!(map.take_dropped().is_empty());
+        let replacement = FocusHandle::new(&map);
+        assert_ne!(replacement.id, old_id);
+        assert!(
+            weak.upgrade().is_none(),
+            "Reusing a slot must not revive its old weak handles"
+        );
+    }
+
+    #[test]
+    fn test_focus_cleanup_without_drops_does_not_lock_the_focus_table() {
+        let map = std::sync::Arc::new(super::FocusMap::default());
+        let handle = FocusHandle::new(&map);
+        let table_lock = map.entries.write();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let map = map.clone();
+            scope.spawn(move || sender.send(map.take_dropped()).unwrap());
+            let result = receiver.recv_timeout(Duration::from_secs(5));
+            // Release the lock even on failure so the worker cannot hang the test.
+            drop(table_lock);
+            assert!(
+                result
+                    .expect("Empty cleanup must not scan or lock the table")
+                    .is_empty()
+            );
+        });
+        drop(handle);
+    }
+
+    #[test]
+    fn test_focus_cleanup_handles_concurrent_drops_and_weak_upgrades() {
+        let map = std::sync::Arc::new(super::FocusMap::default());
+        let handles = (0..128).map(|_| FocusHandle::new(&map)).collect::<Vec<_>>();
+        let weak = handles
+            .iter()
+            .map(FocusHandle::downgrade)
+            .collect::<Vec<_>>();
+        let barrier = std::sync::Barrier::new(2);
+        let mut removed = Vec::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for handle in handles {
+                    drop(handle);
+                    std::thread::yield_now();
+                }
+            });
+            barrier.wait();
+            for handle in &weak {
+                drop(handle.upgrade());
+                removed.extend(map.take_dropped());
+            }
+        });
+        removed.extend(map.take_dropped());
+        assert_eq!(removed.len(), weak.len());
+        removed.sort();
+        removed.dedup();
+        assert_eq!(
+            removed.len(),
+            weak.len(),
+            "Each final drop must be queued exactly once"
+        );
+        assert!(map.entries.read().is_empty());
+        assert!(weak.iter().all(|handle| handle.upgrade().is_none()));
+    }
+
+    #[gpui::test]
+    fn test_focus_cleanup_blurs_only_after_the_last_reference_is_dropped(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let handle = cx.update(|cx| cx.focus_handle());
+        let clone = handle.clone();
+        window
+            .update(cx, |_, window, cx| window.focus(&handle, cx))
+            .unwrap();
+        cx.update(|_| drop(handle));
+        window
+            .update(cx, |_, window, _| assert!(clone.is_focused(window)))
+            .unwrap();
+        cx.update(|_| drop(clone));
+        window
+            .update(cx, |_, window, cx| {
+                assert!(window.focus.is_none());
+                assert!(window.focused(cx).is_none());
+                let replacement = cx.focus_handle();
+                window.focus(&replacement, cx);
+                assert!(replacement.is_focused(window));
+            })
+            .unwrap();
+    }
 
     struct EmptyView;
 
