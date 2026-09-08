@@ -616,6 +616,7 @@ pub struct ConversationView {
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
+    writer_conflict_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
     /// causes mermaid diagrams to re-render).
@@ -897,6 +898,7 @@ impl ConversationView {
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
+            writer_conflict_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
@@ -983,6 +985,12 @@ impl ConversationView {
     /// Drops the cached connection for this agent (so the next request spawns a
     /// fresh server process) and rebuilds the thread state from scratch.
     pub(crate) fn retry_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let ServerState::LoadError { error } = &self.server_state
+            && self.is_writer_conflict(error)
+        {
+            self.reset(window, cx);
+            return;
+        }
         self.connection_store.update(cx, |store, cx| {
             store.restart_connection(self.connection_key.clone(), self.agent.clone(), cx);
         });
@@ -1511,7 +1519,81 @@ impl ConversationView {
             }
         }
         self.emit_load_error_telemetry(&err);
+        let writer_conflict = self.is_writer_conflict(&err);
         self.set_server_state(ServerState::LoadError { error: err }, cx);
+        if writer_conflict {
+            self.resolve_writer_conflict(window, cx);
+        }
+    }
+
+    fn is_writer_conflict(&self, error: &LoadError) -> bool {
+        self.agent.agent_id().as_ref() == agent_servers::CODEX_ID
+            && matches!(error, LoadError::Other(message) if message.contains("already has an active writer"))
+            && self.root_session_id.is_some()
+    }
+
+    fn resolve_writer_conflict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.writer_conflict_task.is_some() {
+            return;
+        }
+        let Some(session_id) = self.root_session_id.clone() else {
+            return;
+        };
+        let project = self.project.clone();
+        let host = project
+            .read(cx)
+            .remote_client()
+            .map(|remote| remote.read(cx).connection_options().host())
+            .unwrap_or_else(|| "this computer".into());
+        let inspection = agent_servers::codex_writer::inspect_writer(
+            project.clone(),
+            session_id.to_string(),
+            cx,
+        );
+        self.writer_conflict_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let inspection = inspection.await;
+                let description = match &inspection {
+                    Ok(inspection) => format!("Connection: {host}\n{}", inspection.description()),
+                    Err(error) => format!("Host: {host}\n\nCould not verify the session owner: {error:#}\n\nClose the session in its original Codex window, then retry."),
+                };
+                let owner = inspection.ok().filter(|inspection| inspection.reason.is_none())
+                    .and_then(|inspection| inspection.owner);
+                let answers: &[&str] = if owner.is_some() {
+                    &["Retry", "Stop existing session and resume here", "Cancel"]
+                } else {
+                    &["Retry", "Cancel"]
+                };
+                if !this.read_with(cx, |this, _| this.root_session_id.as_ref() == Some(&session_id)
+                    && matches!(&this.server_state, ServerState::LoadError { error } if this.is_writer_conflict(error)))? {
+                    return Ok(());
+                }
+                let answer = cx.prompt(gpui::PromptLevel::Warning, "Codex session is already open", Some(&description), answers).await?;
+                let still_conflicted = this.read_with(cx, |this, _| this.root_session_id.as_ref() == Some(&session_id)
+                    && matches!(&this.server_state, ServerState::LoadError { error } if this.is_writer_conflict(error)))?;
+                if !still_conflicted { return Ok(()); }
+                if answer == 1 && let Some(owner) = owner {
+                    cx.update(|_, cx| agent_servers::codex_writer::stop_writer(project, session_id.to_string(), owner, cx))?.await?;
+                } else if answer != 0 {
+                    return Ok(());
+                }
+                this.update_in(cx, |this, window, cx| {
+                    this.writer_conflict_task = None;
+                    // The ACP connection is healthy; restarting it could interrupt other threads.
+                    this.reset(window, cx);
+                })?;
+                anyhow::Ok(())
+            }.await;
+            this.update(cx, |this, cx| {
+                this.writer_conflict_task = None;
+                if let Err(error) = result {
+                    this.set_server_state(ServerState::LoadError {
+                        error: LoadError::Other(format!("Codex already has an active writer.\n{error:#}").into()),
+                    }, cx);
+                }
+                cx.notify();
+            }).log_err();
+        }));
     }
 
     fn handle_agent_servers_updated(
@@ -1526,7 +1608,7 @@ impl ConversationView {
         // This handles the case where a thread is restored before authentication completes.
         let should_retry = match &self.server_state {
             ServerState::Loading { .. } => false,
-            ServerState::LoadError { .. } => true,
+            ServerState::LoadError { error } => !self.is_writer_conflict(error),
             ServerState::Connected(connected) => {
                 connected.auth_state.is_ok() && connected.has_thread_error(cx)
             }
@@ -2754,6 +2836,15 @@ impl ConversationView {
                         this.retry_connection(window, cx);
                     })),
             )
+            .when(self.is_writer_conflict(e), |actions| {
+                actions.child(
+                    Button::new("resolve-codex-writer", "Resolve session conflict…")
+                        .disabled(self.writer_conflict_task.is_some())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.resolve_writer_conflict(window, cx)
+                        })),
+                )
+            })
             .child(self.create_copy_button(message.clone()))
             .into_any_element();
 

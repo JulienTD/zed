@@ -1692,6 +1692,9 @@ impl Project {
             BreakpointStore::init(&remote_proto);
             GitStore::init(&remote_proto);
             AgentServerStore::init_remote(&remote_proto);
+            this.agent_server_store.update(cx, |store, cx| {
+                store.refresh_external_agents(cx).detach_and_log_err(cx);
+            });
 
             this
         })
@@ -5500,13 +5503,28 @@ impl Project {
         this.update(&mut cx, |this, cx| {
             // Don't handle messages that were sent before the response to us joining the project
             if envelope.message_id > this.join_project_response_message_id {
-                cx.update_global::<SettingsStore, _>(|store, cx| {
-                    for worktree_metadata in &envelope.payload.worktrees {
-                        store
-                            .clear_local_settings(WorktreeId::from_proto(worktree_metadata.id), cx)
-                            .log_err();
-                    }
-                });
+                let existing_worktree_ids = this
+                    .worktree_store
+                    .read(cx)
+                    .worktrees()
+                    .map(|worktree| worktree.read(cx).id())
+                    .collect::<HashSet<_>>();
+                let new_worktree_ids = envelope
+                    .payload
+                    .worktrees
+                    .iter()
+                    .map(|metadata| WorktreeId::from_proto(metadata.id))
+                    .filter(|id| !existing_worktree_ids.contains(id))
+                    .collect::<Vec<_>>();
+                // Existing worktrees keep their settings: a metadata update does not
+                // resend their settings files. Only newly introduced IDs can be stale.
+                if !new_worktree_ids.is_empty() {
+                    cx.update_global::<SettingsStore, _>(|store, cx| {
+                        for id in new_worktree_ids {
+                            store.clear_local_settings(id, cx).log_err();
+                        }
+                    });
+                }
 
                 this.set_worktrees_from_proto(envelope.payload.worktrees, cx)?;
             }

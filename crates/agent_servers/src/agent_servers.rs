@@ -1,4 +1,5 @@
 mod acp;
+pub mod codex_writer;
 mod custom;
 
 #[cfg(any(test, feature = "test-support"))]

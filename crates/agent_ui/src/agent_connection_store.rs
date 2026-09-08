@@ -272,9 +272,15 @@ impl AgentConnectionStore {
         cx: &mut Context<Self>,
     ) {
         let store = store.read(cx);
-        self.entries.retain(|key, _| match key {
+        self.entries.retain(|key, entry| match key {
             Agent::NativeAgent => true,
-            Agent::Custom { id } => store.external_agents.contains_key(id),
+            Agent::Custom { id } => {
+                store.external_agents.contains_key(id)
+                    // Registration may have completed after the initial connection failed.
+                    // Let the conversation's retry create a fresh attempt instead of reusing
+                    // the cached "not registered" error.
+                    && !matches!(entry.read(cx), AgentConnectionEntry::Error { .. })
+            }
             #[cfg(any(test, feature = "test-support"))]
             Agent::Stub => true,
         });

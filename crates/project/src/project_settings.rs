@@ -979,7 +979,29 @@ impl SettingsObserver {
         let mut user_settings_watcher = None;
         if cx.try_global::<SettingsStore>().is_some() {
             if let Some(upstream_client) = upstream_client {
-                let mut user_settings = None;
+                // Observers only see future changes. A newly opened remote project must
+                // receive settings even when the user has not edited them since startup.
+                let mut user_settings = cx.global::<SettingsStore>().raw_user_settings().cloned();
+                if let Some(settings) = user_settings.as_ref() {
+                    match serde_json::to_string(settings) {
+                        Ok(contents) => {
+                            if upstream_client
+                                .send(proto::UpdateUserSettings {
+                                    project_id: REMOTE_SERVER_PROJECT_ID,
+                                    contents,
+                                })
+                                .log_err()
+                                .is_none()
+                            {
+                                user_settings = None;
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("Failed to serialize initial remote settings: {error}");
+                            user_settings = None;
+                        }
+                    }
+                }
                 user_settings_watcher = Some(cx.observe_global::<SettingsStore>(move |_, cx| {
                     if let Some(new_settings) = cx.global::<SettingsStore>().raw_user_settings() {
                         if Some(new_settings) != user_settings.as_ref() {

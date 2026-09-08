@@ -2,7 +2,6 @@ use std::{
     any::Any,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -186,6 +185,7 @@ impl ExternalAgentEntry {
 pub struct AgentServerStore {
     state: AgentServerStoreState,
     pub external_agents: HashMap<AgentId, ExternalAgentEntry>,
+    external_agents_generation: u64,
 }
 
 pub struct AgentServersUpdated;
@@ -266,6 +266,7 @@ impl AgentServerStore {
 
     pub fn init_headless(session: &AnyProtoClient) {
         session.add_entity_request_handler(Self::handle_get_agent_server_command);
+        session.add_entity_request_handler(Self::handle_get_external_agents);
     }
 
     fn agent_servers_settings_changed(&mut self, cx: &mut Context<Self>) {
@@ -521,6 +522,7 @@ impl AgentServerStore {
                 _subscriptions: subscriptions,
             },
             external_agents: HashMap::default(),
+            external_agents_generation: 0,
         };
         this.agent_servers_settings_changed(cx);
         this
@@ -538,6 +540,7 @@ impl AgentServerStore {
                 worktree_store,
             },
             external_agents: HashMap::default(),
+            external_agents_generation: 0,
         }
     }
 
@@ -545,31 +548,16 @@ impl AgentServerStore {
         Self {
             state: AgentServerStoreState::Collab,
             external_agents: HashMap::default(),
+            external_agents_generation: 0,
         }
     }
 
-    pub fn shared(&mut self, project_id: u64, client: AnyProtoClient, cx: &mut Context<Self>) {
+    pub fn shared(&mut self, project_id: u64, client: AnyProtoClient, _cx: &mut Context<Self>) {
         match &mut self.state {
             AgentServerStoreState::Local {
                 downstream_client, ..
             } => {
                 *downstream_client = Some((project_id, client.clone()));
-                // Send the current list of external agents downstream, but only after a delay,
-                // to avoid having the message arrive before the downstream project's agent server store
-                // sets up its handlers.
-                cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let names = this.update(cx, |this, _| {
-                        this.external_agents()
-                            .map(|name| name.to_string())
-                            .collect()
-                    })?;
-                    client
-                        .send(proto::ExternalAgentsUpdated { project_id, names })
-                        .log_err();
-                    anyhow::Ok(())
-                })
-                .detach();
             }
             AgentServerStoreState::Remote { .. } => {
                 debug_panic!(
@@ -713,76 +701,128 @@ impl AgentServerStore {
         mut cx: AsyncApp,
     ) -> Result<()> {
         this.update(&mut cx, |this, cx| {
-            let AgentServerStoreState::Remote {
-                project_id,
-                upstream_client,
-                worktree_store,
-            } = &this.state
-            else {
-                debug_panic!(
-                    "handle_external_agents_updated should not be called for a non-remote project"
-                );
-                bail!("unexpected ExternalAgentsUpdated message")
-            };
+            this.external_agents_generation += 1;
+            this.replace_external_agents(envelope.payload.names, cx)
+        })
+    }
 
-            let mut previous_entries = std::mem::take(&mut this.external_agents);
-            let mut new_version_available_txs = HashMap::default();
-            let mut loading_status_txs = HashMap::default();
-            let mut metadata = HashMap::default();
+    fn replace_external_agents(
+        &mut self,
+        names: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let AgentServerStoreState::Remote {
+            project_id,
+            upstream_client,
+            worktree_store,
+        } = &self.state
+        else {
+            debug_panic!(
+                "handle_external_agents_updated should not be called for a non-remote project"
+            );
+            bail!("unexpected ExternalAgentsUpdated message")
+        };
 
-            for (name, mut entry) in previous_entries.drain() {
-                if let Some(tx) = entry.server.take_new_version_available_tx() {
-                    new_version_available_txs.insert(name.clone(), tx);
-                }
-                if let Some(tx) = entry.server.take_loading_status_tx() {
-                    loading_status_txs.insert(name.clone(), tx);
-                }
+        let mut previous_entries = std::mem::take(&mut self.external_agents);
+        let mut new_version_available_txs = HashMap::default();
+        let mut loading_status_txs = HashMap::default();
+        let mut metadata = HashMap::default();
 
-                metadata.insert(name, (entry.icon, entry.display_name, entry.source));
+        for (name, mut entry) in previous_entries.drain() {
+            if let Some(tx) = entry.server.take_new_version_available_tx() {
+                new_version_available_txs.insert(name.clone(), tx);
+            }
+            if let Some(tx) = entry.server.take_loading_status_tx() {
+                loading_status_txs.insert(name.clone(), tx);
             }
 
-            this.external_agents = envelope
-                .payload
-                .names
-                .into_iter()
-                .map(|name| {
-                    let agent_id = AgentId(name.into());
-                    let (icon, display_name, source) = metadata
-                        .remove(&agent_id)
-                        .or_else(|| {
-                            AgentRegistryStore::try_global(cx)
-                                .and_then(|store| store.read(cx).agent(&agent_id))
-                                .map(|s| {
-                                    (
-                                        s.icon_path().cloned(),
-                                        Some(s.name().clone()),
-                                        ExternalAgentSource::Registry,
-                                    )
-                                })
-                        })
-                        .unwrap_or((None, None, ExternalAgentSource::default()));
-                    let agent = RemoteExternalAgentServer {
-                        project_id: *project_id,
-                        upstream_client: upstream_client.clone(),
-                        worktree_store: worktree_store.clone(),
-                        name: agent_id.clone(),
-                        new_version_available_tx: new_version_available_txs.remove(&agent_id),
-                        loading_status_tx: loading_status_txs.remove(&agent_id),
-                    };
-                    (
-                        agent_id,
-                        ExternalAgentEntry::new(
-                            Box::new(agent) as Box<dyn ExternalAgentServer>,
-                            source,
-                            icon,
-                            display_name,
-                        ),
-                    )
-                })
-                .collect();
-            cx.emit(AgentServersUpdated);
-            Ok(())
+            metadata.insert(name, (entry.icon, entry.display_name, entry.source));
+        }
+
+        self.external_agents = names
+            .into_iter()
+            .map(|name| {
+                let agent_id = AgentId(name.into());
+                let (icon, display_name, source) = metadata
+                    .remove(&agent_id)
+                    .or_else(|| {
+                        AgentRegistryStore::try_global(cx)
+                            .and_then(|store| store.read(cx).agent(&agent_id))
+                            .map(|s| {
+                                (
+                                    s.icon_path().cloned(),
+                                    Some(s.name().clone()),
+                                    ExternalAgentSource::Registry,
+                                )
+                            })
+                    })
+                    .unwrap_or((None, None, ExternalAgentSource::default()));
+                let agent = RemoteExternalAgentServer {
+                    project_id: *project_id,
+                    upstream_client: upstream_client.clone(),
+                    worktree_store: worktree_store.clone(),
+                    name: agent_id.clone(),
+                    new_version_available_tx: new_version_available_txs.remove(&agent_id),
+                    loading_status_tx: loading_status_txs.remove(&agent_id),
+                };
+                (
+                    agent_id,
+                    ExternalAgentEntry::new(
+                        Box::new(agent) as Box<dyn ExternalAgentServer>,
+                        source,
+                        icon,
+                        display_name,
+                    ),
+                )
+            })
+            .collect();
+        cx.emit(AgentServersUpdated);
+        Ok(())
+    }
+
+    pub fn refresh_external_agents(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let AgentServerStoreState::Remote {
+            project_id,
+            upstream_client,
+            ..
+        } = &self.state
+        else {
+            return Task::ready(Ok(()));
+        };
+        let generation = self.external_agents_generation;
+        let request = upstream_client
+            .read(cx)
+            .proto_client()
+            .request(proto::GetExternalAgents {
+                project_id: *project_id,
+            });
+        cx.spawn(async move |this, cx| {
+            let response = request.await?;
+            this.update(cx, |this, cx| {
+                // A push received while the request was in flight is newer than the snapshot.
+                if generation == this.external_agents_generation
+                    && (response.names.len() != this.external_agents.len()
+                        || response
+                            .names
+                            .iter()
+                            .any(|name| !this.external_agents.contains_key(name.as_str())))
+                {
+                    this.replace_external_agents(response.names, cx)?;
+                }
+                Ok(())
+            })?
         })
+    }
+
+    async fn handle_get_external_agents(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GetExternalAgents>,
+        cx: AsyncApp,
+    ) -> Result<proto::ExternalAgentsUpdated> {
+        Ok(this.read_with(&cx, |this, _| proto::ExternalAgentsUpdated {
+            project_id: envelope.payload.project_id,
+            names: this.external_agents().map(ToString::to_string).collect(),
+        }))
     }
 
     async fn handle_loading_status_updated(

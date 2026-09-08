@@ -1012,15 +1012,26 @@ impl WorktreeStore {
                 handle_id,
                 worktree.id(),
             ));
-            this.send_project_updates(cx);
+            let previous_count = this.worktrees.len();
+            this.worktrees.retain(|handle| match handle {
+                WorktreeHandle::Strong(handle) => handle.entity_id() != handle_id,
+                WorktreeHandle::Weak(handle) => handle.entity_id() != handle_id,
+            });
+            // Explicit removal already sent an update, even if another owner
+            // kept the worktree alive until now.
+            if this.worktrees.len() != previous_count {
+                this.send_project_updates(cx);
+            }
         })
         .detach();
     }
 
     pub fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
+        let mut removed = false;
         self.worktrees.retain(|worktree| {
             if let Some(worktree) = worktree.upgrade() {
                 if worktree.read(cx).id() == id_to_remove {
+                    removed = true;
                     cx.emit(WorktreeStoreEvent::WorktreeRemoved(
                         worktree.entity_id(),
                         id_to_remove,
@@ -1034,7 +1045,11 @@ impl WorktreeStore {
             }
         });
         self.update_initial_scan_state(cx);
-        self.send_project_updates(cx);
+        // A delayed removal must not produce another full snapshot: the peer
+        // may still be dropping worktrees from older snapshots.
+        if removed {
+            self.send_project_updates(cx);
+        }
     }
 
     pub fn worktree_for_main_worktree_path(

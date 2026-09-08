@@ -1183,8 +1183,10 @@ impl SettingsStore {
 
     /// Add or remove a set of local settings via a JSON string.
     pub fn clear_local_settings(&mut self, root_id: WorktreeId, cx: &mut App) -> Result<()> {
+        let previous_count = self.local_settings.len();
         self.local_settings
             .retain(|(worktree_id, _), _| worktree_id != &root_id);
+        let settings_removed = self.local_settings.len() != previous_count;
 
         self.editorconfig_store
             .update(cx, |store, _cx| store.remove_for_worktree(root_id));
@@ -1192,7 +1194,9 @@ impl SettingsStore {
         for setting_value in self.setting_values.values_mut() {
             setting_value.clear_local_values(root_id);
         }
-        self.recompute_values(Some((root_id, RelPath::empty())), cx);
+        if settings_removed {
+            self.recompute_values(Some((root_id, RelPath::empty())), cx);
+        }
         Ok(())
     }
 
@@ -1863,6 +1867,85 @@ mod tests {
             store.get::<AutoUpdateSetting>(None),
             &AutoUpdateSetting { auto_update: false },
             "dev override from default settings should apply",
+        );
+    }
+
+    #[gpui::test]
+    fn test_clear_local_settings_only_recomputes_when_settings_are_removed(cx: &mut App) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static RECOMPUTATIONS: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountedSettings;
+
+        impl Settings for CountedSettings {
+            fn from_settings(_: &SettingsContent) -> Self {
+                RECOMPUTATIONS.fetch_add(1, Ordering::SeqCst);
+                Self
+            }
+        }
+
+        let mut store = SettingsStore::new(cx, &default_settings());
+        store.register_setting::<CountedSettings>();
+        store.register_setting::<DefaultLanguageSettings>();
+        let worktree_id = WorktreeId::from_usize(1);
+        let other_worktree_id = WorktreeId::from_usize(2);
+        for (id, contents) in [
+            (worktree_id, r#"{"tab_size": 8}"#),
+            (other_worktree_id, r#"{"tab_size": 3}"#),
+        ] {
+            store
+                .set_local_settings(
+                    id,
+                    LocalSettingsPath::InWorktree(RelPath::empty_arc()),
+                    LocalSettingsKind::Settings,
+                    Some(contents),
+                    cx,
+                )
+                .unwrap();
+        }
+        RECOMPUTATIONS.store(0, Ordering::SeqCst);
+
+        store.clear_local_settings(worktree_id, cx).unwrap();
+        assert!(RECOMPUTATIONS.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            store.get::<DefaultLanguageSettings>(Some(SettingsLocation {
+                worktree_id,
+                path: RelPath::empty(),
+            })),
+            store.get::<DefaultLanguageSettings>(None),
+        );
+        assert_eq!(
+            store
+                .get::<DefaultLanguageSettings>(Some(SettingsLocation {
+                    worktree_id: other_worktree_id,
+                    path: RelPath::empty(),
+                }))
+                .tab_size
+                .get(),
+            3,
+        );
+
+        store
+            .set_local_settings(
+                worktree_id,
+                LocalSettingsPath::InWorktree(RelPath::empty_arc()),
+                LocalSettingsKind::Editorconfig,
+                Some("root = true\n[*]\nindent_size = 8\n"),
+                cx,
+            )
+            .unwrap();
+        RECOMPUTATIONS.store(0, Ordering::SeqCst);
+        store.clear_local_settings(worktree_id, cx).unwrap();
+        store.clear_local_settings(worktree_id, cx).unwrap();
+        assert_eq!(RECOMPUTATIONS.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store
+                .editorconfig_store
+                .read(cx)
+                .local_editorconfig_settings(worktree_id)
+                .count(),
+            0,
         );
     }
 

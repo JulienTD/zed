@@ -3,6 +3,10 @@ package zed.messages;
 
 import "task.proto";
 
+message GetExternalAgents {
+  uint64 project_id = 1;
+}
+
 message GetAgentServerCommand {
   uint64 project_id = 1;
   string name = 2;

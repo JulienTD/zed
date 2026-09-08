@@ -247,6 +247,9 @@ impl AgentServer for CustomAgentServer {
         }
         let store = delegate.store.downgrade();
         cx.spawn(async move |cx| {
+            store
+                .update(cx, |store, cx| store.refresh_external_agents(cx))?
+                .await?;
             if is_registry_agent && agent_id.as_ref() == GEMINI_ID {
                 if let Some(api_key) = cx.update(api_key_for_gemini_cli).await.ok() {
                     extra_env.insert("GEMINI_API_KEY".into(), api_key);

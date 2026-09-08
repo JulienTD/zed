@@ -65,6 +65,90 @@ use std::{
 use unindent::Unindent as _;
 use util::{path, path_list::PathList, paths::PathMatcher, rel_path::rel_path};
 
+#[gpui::test(iterations = 5)]
+async fn test_remote_agent_settings_are_sent_without_a_settings_change(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        let mut store = SettingsStore::test(cx);
+        store
+            .set_user_settings(
+                r#"{"agent_servers":{"codex-acp":{"type":"custom","command":"codex-acp"}}}"#,
+                cx,
+            )
+            .unwrap();
+        cx.set_global(store);
+    });
+    cx.run_until_parked();
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    cx.run_until_parked();
+    headless.read_with(server_cx, |headless, cx| {
+        assert!(headless.agent_server_store.read(cx).external_agents()
+            .any(|id| id.as_ref() == "codex-acp"),
+            "A new remote server must receive existing agent settings without an edit or incidental settings notification");
+    });
+    let store = project.read_with(cx, |project, _| project.agent_server_store().clone());
+    store
+        .update(cx, |store, cx| store.refresh_external_agents(cx))
+        .await
+        .unwrap();
+    store.read_with(cx, |store, _| {
+        assert!(store.external_agents().any(|id| id.as_ref() == "codex-acp"));
+    });
+}
+
+#[gpui::test(iterations = 5)]
+async fn test_remote_external_agents_refresh_recovers_missed_update(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    server_cx
+        .update_global(|store: &mut SettingsStore, cx| {
+            store.set_server_settings(
+                r#"{"agent_servers":{"codex-acp":{"type":"custom","command":"codex-acp"}}}"#,
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let store = project.read_with(cx, |project, _| project.agent_server_store().clone());
+    store.update(cx, |store, _| {
+        assert!(store.external_agents().any(|id| id.as_ref() == "codex-acp"));
+        // Model a startup update delivered before the client entity was subscribed.
+        store.external_agents.clear();
+    });
+    store
+        .update(cx, |store, cx| store.refresh_external_agents(cx))
+        .await
+        .unwrap();
+    store.read_with(cx, |store, _| {
+        assert!(store.external_agents().any(|id| id.as_ref() == "codex-acp"));
+    });
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&store, {
+            let notifications = notifications.clone();
+            move |_, _: &project::AgentServersUpdated, _| {
+                notifications.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    });
+    store
+        .update(cx, |store, cx| store.refresh_external_agents(cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        notifications.load(Ordering::SeqCst),
+        0,
+        "An unchanged snapshot must not trigger another connection attempt"
+    );
+}
+
 #[gpui::test]
 async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
@@ -880,6 +964,30 @@ async fn test_remote_settings(cx: &mut TestAppContext, server_cx: &mut TestAppCo
             [ConfiguredLanguageServer::new("override-rust-analyzer")]
         )
     });
+
+    let settings_notifications = Arc::new(AtomicUsize::new(0));
+    let _subscription = cx.update(|cx| {
+        let settings_notifications = settings_notifications.clone();
+        cx.observe_global::<SettingsStore>(move |_| {
+            settings_notifications.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    for _ in 0..3 {
+        headless.update(server_cx, |headless, cx| {
+            headless.worktree_store.update(cx, |store, cx| {
+                store.send_project_updates(cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(
+                LanguageSettings::for_buffer(buffer.read(cx), cx).language_servers,
+                [ConfiguredLanguageServer::new("override-rust-analyzer")],
+                "Unchanged project metadata must preserve worktree settings"
+            );
+        });
+    }
+    assert_eq!(settings_notifications.load(Ordering::SeqCst), 0);
 }
 
 #[gpui::test]
@@ -2703,6 +2811,91 @@ async fn test_adding_then_removing_then_adding_worktrees(
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].path.as_unix_str(), "README.md")
     })
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_remote_worktree_removal_does_not_resend_unchanged_metadata(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code"),
+        json!({
+            "project1": {"a.txt": "a"},
+            "project2": {"b.txt": "b"},
+            "transient.txt": "transient",
+        }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let (_retained_worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    let (removed_worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project2"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let removed_id = removed_worktree.read_with(cx, |worktree, _| worktree.id());
+    let store = headless.read_with(server_cx, |headless, _| headless.worktree_store.clone());
+    let server_worktree = store
+        .read_with(server_cx, |store, cx| store.worktree_for_id(removed_id, cx))
+        .unwrap();
+    let updates = Arc::new(AtomicUsize::new(0));
+    let _subscription = server_cx.update(|cx| {
+        let updates = updates.clone();
+        cx.subscribe(&store, move |_, event, _| {
+            if matches!(
+                event,
+                project::worktree_store::WorktreeStoreEvent::WorktreeUpdateSent(_)
+            ) {
+                updates.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    });
+
+    store.update(server_cx, |store, cx| store.remove_worktree(removed_id, cx));
+    cx.run_until_parked();
+    assert_eq!(updates.swap(0, Ordering::SeqCst), 1);
+
+    for _ in 0..3 {
+        store.update(server_cx, |store, cx| store.remove_worktree(removed_id, cx));
+    }
+    cx.run_until_parked();
+    assert_eq!(updates.load(Ordering::SeqCst), 0);
+
+    server_cx.update(|_| drop(server_worktree));
+    cx.update(|_| drop(removed_worktree));
+    cx.run_until_parked();
+    assert_eq!(updates.load(Ordering::SeqCst), 0);
+    store.read_with(server_cx, |store, cx| {
+        assert!(store.worktree_for_id(removed_id, cx).is_none());
+        assert_eq!(store.worktrees().count(), 1);
+    });
+
+    let (transient_worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/transient.txt"), false, cx)
+        })
+        .await
+        .unwrap();
+    let transient_id = transient_worktree.read_with(cx, |worktree, _| worktree.id());
+    cx.run_until_parked();
+    updates.store(0, Ordering::SeqCst);
+    cx.update(|_| drop(transient_worktree));
+    cx.run_until_parked();
+    assert_eq!(updates.load(Ordering::SeqCst), 1);
+    store.read_with(server_cx, |store, cx| {
+        assert!(store.worktree_for_id(transient_id, cx).is_none());
+        assert_eq!(store.worktrees().count(), 1);
+    });
 }
 
 #[gpui::test]
